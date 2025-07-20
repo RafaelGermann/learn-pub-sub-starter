@@ -1,6 +1,8 @@
 package pubsub
 
 import (
+	"bytes"
+	"encoding/gob"
 	"encoding/json"
 	"fmt"
 
@@ -14,17 +16,67 @@ const (
 	SimpleQueueTransient
 )
 
+type AckType int
+
+const (
+	Ack AckType = iota
+	NackRequeue
+	NackDiscard
+)
+
 func SubscribeJSON[T any](
 	conn *amqp.Connection,
 	exchange,
 	queueName,
 	key string,
 	queueType SimpleQueueType,
-	handler func(T),
+	handler func(T) AckType,
 ) error {
-	ch, queue, err := DeclareAndBind(conn, exchange, queueName, key, queueType)
+	unmarshaller := func(data []byte) (T, error) {
+		var target T
+		err := json.Unmarshal(data, &target)
+		return target, err
+	}
+
+	return subscribe(conn, exchange, queueName, key, queueType, handler, unmarshaller)
+}
+
+func SubscribeGob[T any](
+	conn *amqp.Connection,
+	exchange,
+	queueName,
+	key string,
+	queueType SimpleQueueType,
+	handler func(T) AckType,
+) error {
+	unmarshaller := func(data []byte) (T, error) {
+		buffer := bytes.NewBuffer(data)
+		decoder := gob.NewDecoder(buffer)
+		var target T
+		err := decoder.Decode(&target)
+		return target, err
+	}
+
+	return subscribe(conn, exchange, queueName, key, queueType, handler, unmarshaller)
+}
+
+func subscribe[T any](
+	conn *amqp.Connection,
+	exchange,
+	queueName,
+	key string,
+	simpleQueueType SimpleQueueType,
+	handler func(T) AckType,
+	unmarshaller func([]byte) (T, error),
+) error {
+	ch, queue, err := DeclareAndBind(conn, exchange, queueName, key, simpleQueueType)
 	if err != nil {
 		return fmt.Errorf("could not declare and bind queue: %v", err)
+	}
+
+	err = ch.Qos(10, 0, false)
+	if err != nil {
+		return fmt.Errorf("could not set QoS: %v", err)
 	}
 
 	msgs, err := ch.Consume(
@@ -40,12 +92,6 @@ func SubscribeJSON[T any](
 		return fmt.Errorf("could not consume messages: %v", err)
 	}
 
-	unmarshaller := func(data []byte) (T, error) {
-		var target T
-		err := json.Unmarshal(data, &target)
-		return target, err
-	}
-
 	go func() {
 		defer ch.Close()
 		for msg := range msgs {
@@ -54,8 +100,15 @@ func SubscribeJSON[T any](
 				fmt.Printf("could not unmarshal message: %v\n", err)
 				continue
 			}
-			handler(target)
-			msg.Ack(false)
+
+			switch handler(target) {
+			case Ack:
+				msg.Ack(false)
+			case NackRequeue:
+				msg.Nack(false, true)
+			case NackDiscard:
+				msg.Nack(false, false)
+			}
 		}
 	}()
 	return nil
@@ -79,7 +132,9 @@ func DeclareAndBind(
 		queueType != SimpleQueueDurable,
 		queueType != SimpleQueueDurable,
 		false,
-		nil,
+		amqp.Table{
+			"x-dead-letter-exchange": "peril_dlx",
+		},
 	)
 	if err != nil {
 		return nil, amqp.Queue{}, fmt.Errorf("could not declare queue: %v", err)
